@@ -289,7 +289,7 @@ class DataFetcher:
             return ""
     
     def fetch_rss(self, url: str) -> List[NewsItem]:
-        """解析 RSS/Atom Feed 或网页"""
+        """解析 RSS/Atom Feed 或网页，过滤超过 72 小时的文章"""
         # 特殊处理机器之心（Cloudflare 防护）
         if 'jiqizhixin.com' in url:
             return self.fetch_jiqizhixin()
@@ -299,6 +299,9 @@ class DataFetcher:
             return []
         
         items = []
+        now = datetime.now()
+        cutoff_time = now - timedelta(hours=72)  # 72 小时前的时间点
+        
         try:
             root = ET.fromstring(xml_data)
             
@@ -345,14 +348,22 @@ class DataFetcher:
                         content = self._clean_html(cdata_match.group(1))
                 
                 date_elem = entry.find('pubDate') or entry.find('published') or entry.find('updated')
-                published = date_elem.text if date_elem is not None and date_elem.text else datetime.now().isoformat()
+                published_str = date_elem.text if date_elem is not None and date_elem.text else datetime.now().isoformat()
+                
+                # 解析发布时间并过滤
+                pub_date = self._parse_date(published_str)
+                if pub_date and pub_date < cutoff_time:
+                    # 超过 72 小时，跳过
+                    if debug_mode:
+                        print(f"  [SKIP] 文章超过 72 小时: {title[:50]}... ({pub_date})")
+                    continue
                 
                 if title and link:
                     items.append(NewsItem(
                         title=title,
                         source=url,
                         url=link,
-                        published=published,
+                        published=published_str,
                         content=content,
                         category="rss"
                     ))
@@ -361,6 +372,29 @@ class DataFetcher:
             print(f"[WARN] RSS parse error for {url}: {e}", file=sys.stderr)
         
         return items
+    
+    def _parse_date(self, date_str: str) -> Optional[datetime]:
+        """解析各种格式的日期字符串"""
+        if not date_str:
+            return None
+        
+        formats = [
+            '%Y-%m-%dT%H:%M:%S%z',
+            '%Y-%m-%dT%H:%M:%SZ',
+            '%Y-%m-%dT%H:%M:%S',
+            '%a, %d %b %Y %H:%M:%S %z',
+            '%a, %d %b %Y %H:%M:%S GMT',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d',
+        ]
+        
+        for fmt in formats:
+            try:
+                return datetime.strptime(date_str[:25].strip(), fmt)
+            except:
+                continue
+        
+        return None
     
     def fetch_jiqizhixin(self) -> List[NewsItem]:
         """抓取机器之心网页（绕过 Cloudflare）"""
@@ -610,60 +644,40 @@ class LLMProcessor:
         return min(priority, 10)
     
     def _calculate_recency_score(self, published: str) -> float:
-        """计算时效性分数（0-2.0），越新的文章分数越高"""
+        """计算时效性分数（0-3.0），越新的文章分数越高"""
         try:
             # 解析发布时间
             if not published:
                 return 0.5  # 无发布时间默认较低
             
-            # 尝试多种日期格式
-            pub_date = None
-            formats = [
-                '%Y-%m-%dT%H:%M:%S%z',
-                '%Y-%m-%dT%H:%M:%SZ',
-                '%Y-%m-%dT%H:%M:%S',
-                '%a, %d %b %Y %H:%M:%S %z',
-                '%a, %d %b %Y %H:%M:%S GMT',
-                '%Y-%m-%d %H:%M:%S',
-                '%Y-%m-%d'
-            ]
-            
-            for fmt in formats:
-                try:
-                    pub_date = datetime.strptime(published[:25].strip(), fmt)
-                    break
-                except:
-                    continue
-            
+            pub_date = self._parse_date(published)
             if not pub_date:
                 return 0.5
             
-            # 如果日期没有时区，假设是 UTC
-            if pub_date.tzinfo is None:
-                pub_date = pub_date.replace(tzinfo=None)
-            
-            # 计算距离现在的小时数
-            now = datetime.now()
+            # 如果日期没有时区，假设是本地时间
             if pub_date.tzinfo:
                 from datetime import timezone
-                now = now.replace(tzinfo=timezone.utc)
+                now = datetime.now(pub_date.tzinfo)
+            else:
+                now = datetime.now()
             
+            # 计算距离现在的小时数
             hours_diff = (now - pub_date).total_seconds() / 3600
             
-            # 时效性衰减曲线：
-            # - 0-6 小时：满分 2.0
-            # - 6-24 小时：1.5
-            # - 24-48 小时：1.2
-            # - 48-72 小时：1.0
-            # - 超过 72 小时：0.5
+            # 时效性衰减曲线（加强时效性权重）：
+            # - 0-6 小时：满分 3.0
+            # - 6-24 小时：2.5
+            # - 24-48 小时：2.0
+            # - 48-72 小时：1.5
+            # - 超过 72 小时：0.5（应该已被过滤）
             if hours_diff <= 6:
-                return 2.0
+                return 3.0
             elif hours_diff <= 24:
-                return 1.5
+                return 2.5
             elif hours_diff <= 48:
-                return 1.2
+                return 2.0
             elif hours_diff <= 72:
-                return 1.0
+                return 1.5
             else:
                 return 0.5
         except:
@@ -674,20 +688,20 @@ class LLMProcessor:
         # 质量分
         quality_score = item.priority if item.priority else self._calculate_priority(item)
         
-        # 时效分
+        # 时效分（加强权重）
         recency_score = self._calculate_recency_score(item.published)
         
         # 源权重（基于媒体影响力/阅读量预估）
         source_weights = {
-            '量子位': 1.2,      # 头部 AI 媒体，阅读量高
-            '机器之心': 1.2,    # 头部 AI 媒体
-            '36 氪': 1.1,       # 科技媒体
-            '36氪': 1.1,
-            'Hugging Face Blog': 1.15,  # 技术社区，影响力大
-            'Hugging Face': 1.15,
-            'VentureBeat AI': 1.0,
-            'VentureBeat': 1.0,
-            'AWS Machine Learning': 0.95,  # 官方博客
+            '量子位': 1.3,          # 头部 AI 媒体，阅读量高
+            '机器之心': 1.3,        # 头部 AI 媒体
+            '36 氪': 1.2,           # 科技媒体
+            '36氪': 1.2,
+            'Hugging Face Blog': 0.95,  # 技术博客，降低权重
+            'Hugging Face': 0.95,
+            'VentureBeat AI': 1.1,
+            'VentureBeat': 1.1,
+            'AWS Machine Learning': 1.0,  # 官方博客
         }
         source_weight = source_weights.get(item.source, 1.0)
         
