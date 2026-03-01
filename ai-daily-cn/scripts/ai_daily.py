@@ -609,6 +609,92 @@ class LLMProcessor:
         
         return min(priority, 10)
     
+    def _calculate_recency_score(self, published: str) -> float:
+        """计算时效性分数（0-2.0），越新的文章分数越高"""
+        try:
+            # 解析发布时间
+            if not published:
+                return 0.5  # 无发布时间默认较低
+            
+            # 尝试多种日期格式
+            pub_date = None
+            formats = [
+                '%Y-%m-%dT%H:%M:%S%z',
+                '%Y-%m-%dT%H:%M:%SZ',
+                '%Y-%m-%dT%H:%M:%S',
+                '%a, %d %b %Y %H:%M:%S %z',
+                '%a, %d %b %Y %H:%M:%S GMT',
+                '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%d'
+            ]
+            
+            for fmt in formats:
+                try:
+                    pub_date = datetime.strptime(published[:25].strip(), fmt)
+                    break
+                except:
+                    continue
+            
+            if not pub_date:
+                return 0.5
+            
+            # 如果日期没有时区，假设是 UTC
+            if pub_date.tzinfo is None:
+                pub_date = pub_date.replace(tzinfo=None)
+            
+            # 计算距离现在的小时数
+            now = datetime.now()
+            if pub_date.tzinfo:
+                from datetime import timezone
+                now = now.replace(tzinfo=timezone.utc)
+            
+            hours_diff = (now - pub_date).total_seconds() / 3600
+            
+            # 时效性衰减曲线：
+            # - 0-6 小时：满分 2.0
+            # - 6-24 小时：1.5
+            # - 24-48 小时：1.2
+            # - 48-72 小时：1.0
+            # - 超过 72 小时：0.5
+            if hours_diff <= 6:
+                return 2.0
+            elif hours_diff <= 24:
+                return 1.5
+            elif hours_diff <= 48:
+                return 1.2
+            elif hours_diff <= 72:
+                return 1.0
+            else:
+                return 0.5
+        except:
+            return 0.5
+    
+    def _calculate_final_score(self, item: NewsItem) -> float:
+        """计算综合分数 = 质量分 × 时效分 × 源权重"""
+        # 质量分
+        quality_score = item.priority if item.priority else self._calculate_priority(item)
+        
+        # 时效分
+        recency_score = self._calculate_recency_score(item.published)
+        
+        # 源权重（基于媒体影响力/阅读量预估）
+        source_weights = {
+            '量子位': 1.2,      # 头部 AI 媒体，阅读量高
+            '机器之心': 1.2,    # 头部 AI 媒体
+            '36 氪': 1.1,       # 科技媒体
+            '36氪': 1.1,
+            'Hugging Face Blog': 1.15,  # 技术社区，影响力大
+            'Hugging Face': 1.15,
+            'VentureBeat AI': 1.0,
+            'VentureBeat': 1.0,
+            'AWS Machine Learning': 0.95,  # 官方博客
+        }
+        source_weight = source_weights.get(item.source, 1.0)
+        
+        # 综合分数 = 质量 × 时效 × 源权重
+        final_score = quality_score * recency_score * source_weight
+        return final_score
+    
     def summarize(self, item: NewsItem) -> str:
         """生成简短摘要"""
         # 优先使用已有摘要
@@ -758,32 +844,71 @@ def generate_daily_report(date: Optional[str] = None, output_dir: Optional[str] 
                 if debug:
                     print(f"  [WARN] 摘要生成失败：{e}")
     
-    # 提升量子位和机器之心的优先级
+    # 计算综合分数（质量 × 时效 × 源权重）并排序
+    print("📊 计算文章综合分数（质量 × 时效 × 源权重）...")
     for item in filtered_rss:
-        if item.source in ['量子位', '机器之心']:
-            item.priority = min(item.priority + 2, 10)  # 额外 +2 优先级，最高 10
+        final_score = processor._calculate_final_score(item)
+        # 将综合分数存入 raw_data 用于排序
+        item.raw_data['final_score'] = final_score
+        # 计算时效性信息用于日志
+        recency = processor._calculate_recency_score(item.published)
+        if debug:
+            print(f"  [{item.source}] {item.title[:40]}... | 质量:{item.priority} | 时效:{recency} | 总分:{final_score:.1f}")
     
-    # 按优先级排序
-    sorted_items = sorted(filtered_rss, key=lambda x: -x.priority)
+    # 按综合分数排序（不再单纯按 priority）
+    sorted_items = sorted(filtered_rss, key=lambda x: -x.raw_data.get('final_score', 0))
     
-    # 实施来源配额：量子位最多 80%（8 条/10 条）
-    max_quantum = 8  # 量子位最多 8 条
+    # 时效性过滤：只保留 72 小时内的文章（3天内）
+    recent_items = []
+    for item in sorted_items:
+        recency = processor._calculate_recency_score(item.published)
+        if recency >= 1.0:  # 48小时内
+            recent_items.append(item)
+    
+    # 如果没有足够的新文章，放宽到 72 小时
+    if len(recent_items) < 5:
+        recent_items = []
+        for item in sorted_items:
+            recency = processor._calculate_recency_score(item.published)
+            if recency >= 0.5:  # 72小时内
+                recent_items.append(item)
+    
+    print(f"  ✓ 筛选后剩余 {len(recent_items)} 篇时效性合格的文章（72小时内）")
+    
+    # 实施来源配额：量子位最多 70%（7 条/10 条），保证多样性
+    max_quantum = 7  # 量子位最多 7 条
+    max_huggingface = 3  # Hugging Face 最多 3 条
     quantum_count = 0
+    hf_count = 0
     selected_items = []
     
-    # 第一轮：选择非量子位的高优先级文章（至少 2 条）
-    for item in sorted_items:
-        if item.source != '量子位' and len(selected_items) < 10 - max_quantum:
+    # 第一轮：选择非量子位、非 Hugging Face 的高分文章（至少 3 条）
+    for item in recent_items:
+        if len(selected_items) >= 10:
+            break
+        if item.source not in ['量子位', 'Hugging Face Blog', 'Hugging Face'] and len(selected_items) < 3:
             selected_items.append(item)
     
-    # 第二轮：选择量子位文章（最多 8 条）
-    for item in sorted_items:
+    # 第二轮：选择 Hugging Face 文章（最多 3 条）
+    for item in recent_items:
+        if len(selected_items) >= 10:
+            break
+        if item.source in ['Hugging Face Blog', 'Hugging Face'] and hf_count < max_huggingface:
+            if item not in selected_items:
+                selected_items.append(item)
+                hf_count += 1
+    
+    # 第三轮：选择量子位文章（最多 7 条）
+    for item in recent_items:
+        if len(selected_items) >= 10:
+            break
         if item.source == '量子位' and quantum_count < max_quantum:
-            selected_items.append(item)
-            quantum_count += 1
+            if item not in selected_items:
+                selected_items.append(item)
+                quantum_count += 1
     
-    # 第三轮：如果还有空位，补充其他高优先级文章
-    for item in sorted_items:
+    # 第四轮：如果还有空位，补充其他高分文章
+    for item in recent_items:
         if len(selected_items) >= 10:
             break
         if item not in selected_items:
@@ -791,6 +916,13 @@ def generate_daily_report(date: Optional[str] = None, output_dir: Optional[str] 
     
     # 最终限制 10 条
     report.articles = selected_items[:10]
+    
+    # 打印选中文章的时间分布
+    print(f"\n📅 选中文章的时间分布：")
+    for i, item in enumerate(report.articles, 1):
+        recency = processor._calculate_recency_score(item.published)
+        time_desc = "6小时内" if recency == 2.0 else "24小时内" if recency == 1.5 else "48小时内" if recency == 1.2 else "72小时内"
+        print(f"  {i}. [{item.source}] {time_desc} | {item.title[:50]}...")
     
     # 2. 抓取 KOL 动态（Tavily）
     print("🐦 抓取 KOL 动态...")
